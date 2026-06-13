@@ -1,4 +1,4 @@
-# Minimal placeholder for SyncCrazyflie used by tests
-class SyncCrazyflie:
-    pass
+"""Re-export for 'from cflib.crazyflie.syncCrazyflie import SyncCrazyflie'."""
+from cflib.crazyflie import SyncCrazyflie
 
+__all__ = ["SyncCrazyflie"]

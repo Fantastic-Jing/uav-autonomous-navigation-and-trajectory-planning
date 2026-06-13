@@ -1,4 +1,4 @@
-def init_drivers():
-    # No-op for tests
-    return
+"""Mock cflib.crtp - just needs to not crash."""
 
+def init_drivers():
+    pass
