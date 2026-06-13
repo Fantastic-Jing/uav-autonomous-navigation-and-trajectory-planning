@@ -1,0 +1,15 @@
+[project]
+name = "retroflight"
+version = "0.1.0"
+description = "2D top-down UAV simulation with numpy and pygame"
+authors = [{ name = "Jan Zwiener" }]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20,<3.0",
+    "pygame-ce>=2.4.0,<3.0"
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["retroflight"]
+
