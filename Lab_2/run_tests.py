@@ -1,243 +1,370 @@
+#!/usr/bin/env python3
+"""
+run_tests.py - UAV Lab 2 Pre-Flight Test Harness
+=================================================
+
+Usage:
+    python run_tests.py <your_script.py>
+
+The script injects a mock cflib into sys.modules so the code runs
+without real hardware or a Crazyradio dongle.  It then checks:
+
+  Pre-Flight Check tests
+  ----------------------
+  1. PASS scenario        - mission must continue
+  2. Low battery          - must abort
+  3. Bad attitude         - must abort
+  4. High Kalman variance - must abort
+  5. Unstable velocity    - must abort
+  6. Bad RSSI             - must abort
+  7. No LH deck           - must abort
+
+  Trajectory tests (run against healthy scenario)
+  ------------------------------------------------
+  8. Task 2 - hover       - takeoff + hover + land present
+  9. Task 3 - rectangle   - all 4 sides, correct height (~1 m), sane speed
+"""
+
 import sys
-import time
-from threading import Event
+import os
+import importlib
+import importlib.util
+import types
+import traceback
 
-import cflib.crtp
-from cflib.crazyflie import Crazyflie
-from cflib.crazyflie.log import LogConfig
-from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
-from cflib.crazyflie.syncLogger import SyncLogger
-from cflib.positioning.motion_commander import MotionCommander
+# ---------------------------------------------------------------------------
+# 0.  Inject mock cflib
+# ---------------------------------------------------------------------------
+MOCK_DIR = os.path.join(os.path.dirname(__file__), "cflib_mock")
+sys.path.insert(0, MOCK_DIR)
 
-# TODO: Replace XX with your assigned drone number (e.g. 01, 02 ... 0A)
-URI = 'radio://0/80/2M/DABADA55XX'
+# Pre-load the mock packages so sub-imports resolve correctly
+import cflib                                                        # noqa: E402
+import cflib.crtp                                                   # noqa: E402
+import cflib.crazyflie                                              # noqa: E402
+import cflib.crazyflie.log                                          # noqa: E402
+import cflib.crazyflie.syncCrazyflie                                # noqa: E402
+import cflib.crazyflie.syncLogger                                   # noqa: E402
+import cflib.positioning                                            # noqa: E402
+import cflib.positioning.motion_commander                           # noqa: E402
 
-# Set by param callback when the Lighthouse deck is detected
-lh_deck_attached = Event()
+from cflib.positioning.motion_commander import MotionCommander      # noqa: E402
 
 
-def param_deck_lighthouse(_, value_str):
-    """Param callback: set event if Lighthouse deck is present (value == 1)."""
-    if int(value_str):
-        lh_deck_attached.set()
+# ---------------------------------------------------------------------------
+# 1.  Helpers
+# ---------------------------------------------------------------------------
+PASS  = "\033[32m PASS \033[0m"
+FAIL  = "\033[31m FAIL \033[0m"
+WARN  = "\033[33m WARN \033[0m"
+INFO  = "\033[36m INFO \033[0m"
+
+_results: list[tuple[str, bool, str]] = []   # (test_name, ok, detail)
+
+def record(name: str, ok: bool, detail: str = ""):
+    _results.append((name, ok, detail))
+    icon = PASS if ok else FAIL
+    print(f"  [{icon}] {name}" + (f"  — {detail}" if detail else ""))
 
 
-def pre_flight_check(scf):
+def load_student_module(path: str) -> types.ModuleType:
+    """Load the test script as a module without executing __main__."""
+    spec = importlib.util.spec_from_file_location("student_mission", path)
+    mod  = importlib.util.module_from_spec(spec)
+    # Prevent the if __name__ == '__main__' block from running
+    mod.__name__ = "student_mission"
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _reset_student_events(mod):
     """
-    Task 1: Pre-Flight Safety Check.
-
-    Verifies the following conditions before allowing any flight command:
-      1. Lighthouse deck attached and callback confirmed (hardware present).
-      2. Kalman filter variance low enough to confirm LH positioning is
-         stable and precise (varPX < 0.01, i.e. std-dev < 0.1 m).
-         Simply detecting the deck is insufficient — the filter must have
-         converged on a reliable position estimate before take-off.
-      3. Drone is level: |roll| <= 2° and |pitch| <= 2°.
-      4. Drone is stationary: |vx| < 0.2 m/s and |vy| < 0.2 m/s.
-      5. Battery voltage strictly above 3.7 V.
-      6. Radio link quality: RSSI absolute value < 80 dBm.
-         In cflib, radio.rssi is the absolute value of the received signal
-         strength in dBm (e.g. 40 means -40 dBm). Higher values mean weaker
-         signal. A value >= 80 indicates a marginal link likely to drop mid-
-         flight and cause a crash.
-
-    Returns True if all checks pass, False otherwise.
-
-    Byte budget (LogConfig limit: 26 bytes):
-      pm.vbat             float  4 B
-      kalman.varPX        float  4 B
-      stateEstimate.roll  FP16   2 B
-      stateEstimate.pitch FP16   2 B
-      stateEstimate.vx    FP16   2 B
-      stateEstimate.vy    FP16   2 B
-      radio.rssi          FP16   2 B
-      Total                     18 B
+    Clear all threading.Event objects at module level in the student script.
+    Events like lh_deck_attached are global state — once set in scenario N
+    they would bleed into scenario N+1 otherwise.
     """
-    print("--- Starting Pre-Flight Check ---")
+    import threading
+    for name, obj in vars(mod).items():
+        if isinstance(obj, threading.Event):
+            obj.clear()
 
-    # ── Check 1: Lighthouse deck ────────────────────────────────────────────
-    # Register param callback; fires immediately with the current value
-    scf.cf.param.add_update_callback(
-        group='deck', name='bcLighthouse4', cb=param_deck_lighthouse
-    )
-    # Allow time for the parameter callback to be invoked
-    time.sleep(1)
 
-    if not lh_deck_attached.is_set():
-        print("[FAIL] Lighthouse deck not detected.")
+def run_preflight(mod, scenario_overrides: dict) -> "bool | None":
+    """
+    Run the student's pre_flight_check() under a specific scenario.
+    Returns True/False (passed/failed) or None on crash.
+    """
+    cflib.reset_scenario()
+    cflib.set_scenario(scenario_overrides)
+    _reset_student_events(mod)   # clear lh_deck_attached etc. between runs
+
+    from cflib.crazyflie import Crazyflie, SyncCrazyflie
+    scf = SyncCrazyflie.__new__(SyncCrazyflie)
+    scf.uri = "radio://0/80/2M/TESTTEST"
+    scf.cf  = Crazyflie()
+
+    try:
+        result = mod.pre_flight_check(scf)
+        return bool(result)
+    except SystemExit as e:
+        # sys.exit(1) counts as "aborted" = False
         return False
-    print("[OK] Lighthouse deck detected.")
-
-    # ── Checks 2-6: Telemetry ───────────────────────────────────────────────
-    logconf = LogConfig(name='PreFlight', period_in_ms=250)
-
-    # float (4 B each) — full precision needed for voltage and variance
-    logconf.add_variable('pm.vbat',      'float')
-    logconf.add_variable('kalman.varPX', 'float')
-
-    # FP16 (2 B each) — sufficient precision for state estimates
-    logconf.add_variable('stateEstimate.roll',  'FP16')
-    logconf.add_variable('stateEstimate.pitch', 'FP16')
-    logconf.add_variable('stateEstimate.vx',    'FP16')
-    logconf.add_variable('stateEstimate.vy',    'FP16')
-    logconf.add_variable('radio.rssi',          'FP16')
-
-    passed = False
-
-    with SyncLogger(scf, logconf) as logger:
-        # Collect telemetry for 3 seconds then evaluate a single snapshot
-        end_time = time.time() + 3.0
-        for log_entry in logger:
-            data = log_entry[1]
-            if time.time() < end_time:
-                continue
-
-            # Read all telemetry values
-            vbat   = data['pm.vbat']
-            var_px = data['kalman.varPX']
-            roll   = data['stateEstimate.roll']
-            pitch  = data['stateEstimate.pitch']
-            vx     = data['stateEstimate.vx']
-            vy     = data['stateEstimate.vy']
-            rssi   = data['radio.rssi']
-
-            print(f"  Battery   : {vbat:.2f} V")
-            print(f"  varPX     : {var_px:.4f} (std {var_px**0.5:.3f} m)")
-            print(f"  Roll/Pitch: {roll:.1f}° / {pitch:.1f}°")
-            print(f"  Velocity  : vx={vx:.2f} m/s  vy={vy:.2f} m/s")
-            print(f"  RSSI      : {rssi:.0f} dBm (abs)")
-
-            # Check 2: Kalman variance — confirms LH positioning is stable
-            if var_px >= 0.01:
-                print(f"[FAIL] Kalman variance too high: "
-                      f"varPX={var_px:.4f} >= 0.01 "
-                      f"(std={var_px**0.5:.3f} m, threshold 0.1 m)")
-                break
-
-            # Check 3: Level surface
-            if abs(roll) > 2.0 or abs(pitch) > 2.0:
-                print(f"[FAIL] Attitude out of range: "
-                      f"roll={roll:.1f}°, pitch={pitch:.1f}° (limit ±2°)")
-                break
-
-            # Check 4: Stationary
-            if abs(vx) >= 0.2 or abs(vy) >= 0.2:
-                print(f"[FAIL] Drone not stationary: "
-                      f"vx={vx:.2f} m/s, vy={vy:.2f} m/s (limit 0.2 m/s)")
-                break
-
-            # Check 5: Battery voltage
-            if vbat <= 3.7:
-                print(f"[FAIL] Battery too low: {vbat:.2f} V (<= 3.7 V)")
-                break
-
-            # Check 6: Radio link quality
-            if rssi >= 80:
-                print(f"[FAIL] Weak radio link: RSSI={rssi:.0f} dBm (>= 80)")
-                break
-
-            # All checks passed
-            passed = True
-            break
-
-    if passed:
-        print("--- Pre-Flight Check: PASSED ---")
-    else:
-        print("--- Pre-Flight Check: FAILED ---")
-
-    return passed
+    except Exception:
+        print("    [EXCEPTION in pre_flight_check]")
+        traceback.print_exc()
+        return None
 
 
-def task2_manual_hover(scf):
+def run_task(mod, func_name: str, scenario_overrides: dict | None = None):
     """
-    Task 2: Take off to 0.5 m, hover for 5 seconds, then land.
-
-    MotionCommander issues take_off() automatically on context entry
-    and land() automatically on context exit.
+    Run a flight task function and return the MotionCommander session.
+    Returns the MotionCommander instance or None on crash.
     """
-    print("\n--- Executing Task 2: Hover ---")
+    cflib.reset_scenario()
+    if scenario_overrides:
+        cflib.set_scenario(scenario_overrides)
 
-    with MotionCommander(scf, default_height=0.5) as mc:
-        print("  Hovering at 0.5 m for 5 seconds...")
-        time.sleep(5)
-        print("  Hover complete, landing...")
+    from cflib.crazyflie import Crazyflie, SyncCrazyflie
+    scf = SyncCrazyflie.__new__(SyncCrazyflie)
+    scf.uri = "radio://0/80/2M/TESTTEST"
+    scf.cf  = Crazyflie()
 
-    print("--- Task 2 complete ---")
+    MotionCommander.last_session = None
+    try:
+        getattr(mod, func_name)(scf)
+    except SystemExit:
+        pass
+    except Exception:
+        print(f"    [EXCEPTION in {func_name}]")
+        traceback.print_exc()
+        return None
+
+    return MotionCommander.last_session
 
 
-def task3_autonomous_rectangle(scf):
+# ---------------------------------------------------------------------------
+# 2.  Pre-Flight Check tests
+# ---------------------------------------------------------------------------
+def test_preflight(mod):
+    print("\n── Pre-Flight Check Tests ──────────────────────────────────────")
+
+    # 2.1 Healthy → should PASS
+    r = run_preflight(mod, {})
+    record("Healthy scenario → pre-flight PASSES", r is True,
+           "returned False or crashed" if r is not True else "")
+
+    # 2.2 Low battery
+    r = run_preflight(mod, {"vbat": 3.5})
+    record("Low battery (3.5 V) → pre-flight ABORTS", r is False,
+           "should have returned False but didn't" if r is not False else "")
+
+    # 2.3 Bad attitude (roll too high)
+    r = run_preflight(mod, {"roll": 5.0})
+    record("Bad attitude (roll=5°) → pre-flight ABORTS", r is False,
+           "should have returned False but didn't" if r is not False else "")
+
+    # 2.4 High Kalman variance (sqrt(0.02) ≈ 0.14 m > 0.08 threshold)
+    r = run_preflight(mod, {"varPX": 0.02})
+    record("High Kalman variance (varPX=0.02) → pre-flight ABORTS", r is False,
+           "should have returned False but didn't" if r is not False else "")
+
+    # 2.5 Unstable velocity
+    r = run_preflight(mod, {"vx": 0.5})
+    record("Unstable velocity (vx=0.5 m/s) → pre-flight ABORTS", r is False,
+           "should have returned False but didn't" if r is not False else "")
+
+    # 2.6 Bad RSSI  (very weak signal)
+    r = run_preflight(mod, {"rssi": 85})
+    record("Bad RSSI (85 dBm) → pre-flight ABORTS", r is False,
+           "RSSI check missing or threshold too low" if r is not False else "")
+
+    # 2.7 No Lighthouse deck
+    r = run_preflight(mod, {"lh_deck": False})
+    record("No LH deck attached → pre-flight ABORTS", r is False,
+           "Lighthouse deck check missing" if r is not False else "")
+
+
+# ---------------------------------------------------------------------------
+# 3.  Task 2 — hover
+# ---------------------------------------------------------------------------
+def test_task2(mod):
+    print("\n── Task 2: Hover ───────────────────────────────────────────────")
+
+    if not hasattr(mod, "task2_manual_hover"):
+        record("task2_manual_hover() exists", False, "function not found in script")
+        return
+
+    mc = run_task(mod, "task2_manual_hover")
+    if mc is None:
+        record("task2_manual_hover() runs without crash", False)
+        return
+
+    record("task2_manual_hover() runs without crash", True)
+    record("Task 2: takeoff was issued",
+           mc.has_cmd("takeoff"),
+           "no takeoff recorded")
+    record("Task 2: land was issued",
+           mc.has_cmd("land") or mc.has_cmd("stop"),
+           "no land/stop recorded — drone never lands?")
+
+    height = mc.default_height
+    record(f"Task 2: takeoff height 0.5 m (got {height:.2f} m)",
+           abs(height - 0.5) < 0.05,
+           f"expected ~0.5 m, got {height:.2f} m")
+
+
+# ---------------------------------------------------------------------------
+# 4.  Task 3 - rectangle
+# ---------------------------------------------------------------------------
+def _rectangle_check(mc: MotionCommander):
     """
-    Task 3: Fly a 1 m x 1 m rectangle at 1.0 m altitude.
+    Check that the four rectangle sides are present.
 
-    Flight sequence:
-      - Take off to 1.0 m
-      - Pause briefly to stabilize
-      - Fly four sides: forward → left → back → right
-      - Make a distinct stop at each corner
-      - Return to start and land
-
-    Corner stops use mc.stop() followed by a short sleep to ensure
-    the drone is stationary before the next move.
+    Rules:
+    - Need at least one forward/back AND at least one left/right move
+    - The dominant moves should cover ~1 m each
+    - Exactly 4 lateral move commands makes a rectangle (we allow 3–6 for
+      approaches where the test might split a side or add extra steps)
+    - Takeoff height should be ~1.0 m
+    - Velocity should be > 0 and ≤ 3.0 m/s (sanity bound)
     """
-    print("\n--- Executing Task 3: 1x1m Rectangle ---")
+    issues = []
+    moves = mc.movement_commands()
 
-    # Time to pause at each corner in seconds
-    corner_pause = 1.0
+    lateral = [c for c in moves if c["cmd"] in ("forward", "back", "left", "right")]
+    fwd_back = [c for c in lateral if c["cmd"] in ("forward", "back")]
+    lr       = [c for c in lateral if c["cmd"] in ("left", "right")]
 
-    with MotionCommander(scf, default_height=1.0) as mc:
-        print("  Stabilizing after takeoff...")
-        time.sleep(1.0)
+    ok_sides = len(fwd_back) >= 1 and len(lr) >= 1
+    if not ok_sides:
+        issues.append("need both forward/back AND left/right moves for a rectangle")
 
-        # Side 1: forward 1 m
-        print("  Side 1: forward 1.0 m")
-        mc.forward(1.0)
-        mc.stop()
-        time.sleep(corner_pause)
+    # Distance check — each lateral move should be close to 1 m
+    all_lateral_dists = [c.get("distance", 0) for c in lateral]
+    if all_lateral_dists:
+        avg_dist = sum(all_lateral_dists) / len(all_lateral_dists)
+        if not (0.7 <= avg_dist <= 1.5):
+            issues.append(f"average lateral distance {avg_dist:.2f} m — expected ~1.0 m")
 
-        # Side 2: left 1 m
-        print("  Side 2: left 1.0 m")
-        mc.left(1.0)
-        mc.stop()
-        time.sleep(corner_pause)
+    # Side count
+    n_sides = len(lateral)
+    if n_sides < 3:
+        issues.append(f"only {n_sides} lateral move(s) — a rectangle needs 4")
 
-        # Side 3: back 1 m
-        print("  Side 3: back 1.0 m")
-        mc.back(1.0)
-        mc.stop()
-        time.sleep(corner_pause)
+    # Velocity sanity
+    vels = [c.get("velocity", 0) for c in lateral if "velocity" in c]
+    if vels:
+        max_v = max(vels)
+        if max_v > 3.0:
+            issues.append(f"velocity {max_v:.1f} m/s seems dangerously high (> 3 m/s)")
+        if max_v <= 0:
+            issues.append("velocity is zero or negative")
 
-        # Side 4: right 1 m — returns to starting XY position
-        print("  Side 4: right 1.0 m")
-        mc.right(1.0)
-        mc.stop()
-        time.sleep(corner_pause)
-
-        print("  Rectangle complete, landing...")
-
-    print("--- Task 3 complete ---")
+    return issues, n_sides, all_lateral_dists
 
 
-if __name__ == '__main__':
-    cflib.crtp.init_drivers()
-    print(f"Drivers initialized. Connecting to drone: {URI} ...")
+def test_task3(mod):
+    print("\n── Task 3: Rectangle ───────────────────────────────────────────")
 
-    with SyncCrazyflie(URI, cf=Crazyflie(rw_cache='./cache')) as scf:
-        print("Connected!")
+    if not hasattr(mod, "task3_autonomous_rectangle"):
+        record("task3_autonomous_rectangle() exists", False, "function not found in script")
+        return
 
-        # 1. Run Pre-Flight Check
-        is_safe_to_fly = pre_flight_check(scf)
-        if not is_safe_to_fly:
-            print("Mission aborted due to Pre-Flight Check failure.")
+    mc = run_task(mod, "task3_autonomous_rectangle")
+    if mc is None:
+        record("task3_autonomous_rectangle() runs without crash", False)
+        return
+
+    record("task3_autonomous_rectangle() runs without crash", True)
+
+    # Height
+    height = mc.default_height
+    record(f"Task 3: takeoff height ~1.0 m (got {height:.2f} m)",
+           abs(height - 1.0) < 0.1,
+           f"expected ~1.0 m, got {height:.2f} m")
+
+    # Rectangle geometry
+    issues, n_sides, dists = _rectangle_check(mc)
+
+    dist_str = ", ".join(f"{d:.2f}" for d in dists) if dists else "none"
+    record(f"Task 3: lateral moves present ({n_sides} recorded, distances: {dist_str} m)",
+           n_sides >= 3,
+           "; ".join(issues) if issues else "")
+
+    # Individual direction checks
+    moves = mc.movement_commands()
+    for direction in ("forward", "back", "left", "right"):
+        present = any(c["cmd"] == direction for c in moves)
+        record(f"Task 3: '{direction}' command present", present,
+               f"'{direction}' never called — rectangle incomplete")
+
+    # Landing
+    record("Task 3: land was issued",
+           mc.has_cmd("land") or mc.has_cmd("stop"),
+           "no land/stop recorded")
+
+
+# ---------------------------------------------------------------------------
+# 5.  Summary
+# ---------------------------------------------------------------------------
+def print_summary():
+    print("\n" + "═" * 60)
+    print("  SUMMARY")
+    print("═" * 60)
+    passed = sum(1 for _, ok, _ in _results if ok)
+    total  = len(_results)
+    for name, ok, detail in _results:
+        icon = "✓" if ok else "✗"
+        line = f"  {icon}  {name}"
+        if not ok and detail:
+            line += f"\n       → {detail}"
+        print(line)
+    print("─" * 60)
+    color = "\033[32m" if passed == total else "\033[33m" if passed >= total // 2 else "\033[31m"
+    print(f"{color}  {passed}/{total} checks passed\033[0m")
+    print("═" * 60)
+    return passed == total
+
+
+# ---------------------------------------------------------------------------
+# 6.  Entry point
+# ---------------------------------------------------------------------------
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python run_tests.py <test_script.py>")
+        sys.exit(1)
+
+    script_path = sys.argv[1]
+    if not os.path.isfile(script_path):
+        print(f"Error: file not found: {script_path}")
+        sys.exit(1)
+
+    print("=" * 60)
+    print(f"  UAV Lab 2 — Mock Test Harness")
+    print(f"  Testing: {script_path}")
+    print("=" * 60)
+
+    try:
+        mod = load_student_module(script_path)
+    except Exception as e:
+        print(f"\n[FATAL] Could not load test script: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # Check required functions exist first
+    for fn in ("pre_flight_check", "task2_manual_hover", "task3_autonomous_rectangle"):
+        if not hasattr(mod, fn):
+            print(f"\n[FATAL] Required function '{fn}' not found in {script_path}")
+            print("        Make sure you haven't renamed or deleted it.")
             sys.exit(1)
 
-        # Arm the Crazyflie
-        scf.cf.supervisor.send_arming_request(True)
-        time.sleep(1.0)
+    test_preflight(mod)
+    test_task2(mod)
+    test_task3(mod)
 
-        # 2. Run Task 2
-        task2_manual_hover(scf)
+    all_ok = print_summary()
+    sys.exit(0 if all_ok else 1)
 
-        # 3. Run Task 3
-        task3_autonomous_rectangle(scf)
 
-        print("\nLab tasks completed successfully!")
+if __name__ == "__main__":
+    main()
