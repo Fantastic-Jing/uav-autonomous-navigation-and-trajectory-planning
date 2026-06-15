@@ -26,33 +26,15 @@ def pre_flight_check(scf):
     """
     Task 1: Pre-Flight Safety Check.
 
-    Verifies the following conditions before allowing any flight command:
-      1. Lighthouse deck attached and callback confirmed (hardware present).
-      2. Kalman filter variance low enough to confirm LH positioning is
-         stable and precise (varPX < 0.01, i.e. std-dev < 0.1 m).
-         Simply detecting the deck is insufficient — the filter must have
-         converged on a reliable position estimate before take-off.
-      3. Drone is level: |roll| <= 2° and |pitch| <= 2°.
-      4. Drone is stationary: |vx| < 0.2 m/s and |vy| < 0.2 m/s.
-      5. Battery voltage strictly above 3.7 V.
-      6. Radio link quality: RSSI absolute value < 80 dBm.
-         In cflib, radio.rssi is the absolute value of the received signal
-         strength in dBm (e.g. 40 means -40 dBm). Higher values mean weaker
-         signal. A value >= 80 indicates a marginal link likely to drop mid-
-         flight and cause a crash.
+    Monitors parameters and telemetry to ensure the drone is ready for flight.
 
-    Returns True if all checks pass, False otherwise.
+    We check bcLighthouse4 param to confirm the deck is physically present,
+    then verify kalman.varPX < 0.01 to ensure the position estimate has
+    actually converged.
 
-    Byte budget (LogConfig limit: 26 bytes):
-      pm.vbat             float  4 B
-      kalman.varPX        float  4 B
-      stateEstimate.roll  FP16   2 B
-      stateEstimate.pitch FP16   2 B
-      stateEstimate.vx    FP16   2 B
-      stateEstimate.vy    FP16   2 B
-      radio.rssi          FP16   2 B
-      Total                     18 B
     """
+
+
     print("--- Starting Pre-Flight Check ---")
 
     # ── Check 1: Lighthouse deck ────────────────────────────────────────────
@@ -72,14 +54,19 @@ def pre_flight_check(scf):
     logconf = LogConfig(name='PreFlight', period_in_ms=250)
 
     # float (4 B each) — full precision needed for voltage and variance
-    logconf.add_variable('pm.vbat',      'float')
-    logconf.add_variable('kalman.varPX', 'float')
+    logconf.add_variable('pm.vbat',      'float')   # Battery voltage
+    logconf.add_variable('kalman.varPX', 'float')   # Kalman filter variance in X
 
     # FP16 (2 B each) — sufficient precision for state estimates
+    # attitude angles [deg]
     logconf.add_variable('stateEstimate.roll',  'FP16')
     logconf.add_variable('stateEstimate.pitch', 'FP16')
+
+    # horizontal velocity [m/s]
     logconf.add_variable('stateEstimate.vx',    'FP16')
     logconf.add_variable('stateEstimate.vy',    'FP16')
+
+    # received signal strength, absolute value [dBm]
     logconf.add_variable('radio.rssi',          'FP16')
 
     passed = False
@@ -152,8 +139,6 @@ def task2_manual_hover(scf):
     """
     Task 2: Take off to 0.5 m, hover for 5 seconds, then land.
 
-    MotionCommander issues take_off() automatically on context entry
-    and land() automatically on context exit.
     """
     print("\n--- Executing Task 2: Hover ---")
 
@@ -168,16 +153,6 @@ def task2_manual_hover(scf):
 def task3_autonomous_rectangle(scf):
     """
     Task 3: Fly a 1 m x 1 m rectangle at 1.0 m altitude.
-
-    Flight sequence:
-      - Take off to 1.0 m
-      - Pause briefly to stabilize
-      - Fly four sides: forward → left → back → right
-      - Make a distinct stop at each corner
-      - Return to start and land
-
-    Corner stops use mc.stop() followed by a short sleep to ensure
-    the drone is stationary before the next move.
     """
     print("\n--- Executing Task 3: 1x1m Rectangle ---")
 
