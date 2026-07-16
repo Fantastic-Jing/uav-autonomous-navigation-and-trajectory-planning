@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: retroflight
-Version: 0.1.0
-Summary: 2D top-down UAV simulation with numpy and pygame
-Author: Jan Zwiener
-Requires-Python: >=3.8
-Requires-Dist: numpy<3.0,>=1.20
-Requires-Dist: pygame-ce<3.0,>=2.4.0
