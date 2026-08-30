@@ -1,0 +1,15 @@
+# Python cache and build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Local simulator and Crazyflie state
+cache/
+*.log
+
+# Future generated test outputs
+.pytest_cache/
+coverage.xml
